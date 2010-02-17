@@ -1,0 +1,2 @@
+use ForkRing;
+ForkRing::runTests();
