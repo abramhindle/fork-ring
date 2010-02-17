@@ -45,6 +45,7 @@ package ForkBaby;
 #Fork Baby wraps underlying perl code
 #The perl code will just read and write
 use Moose;
+use Data::Dumper;
 $| = 1;
 use IO::Pipe;
 use Time::Out qw(timeout) ;
@@ -81,10 +82,11 @@ sub send {
     my $isParent = $self->isParent();
     die "[$$] [send] Not a parent, not forked [$msg] [$hasForked] [$isParent]" unless ($hasForked && $isParent);
     die "Not a parent, not forked [$msg]" unless (my $child_pid = $self->isParent());
-    die "Command has a newline in it!" if ($msg =~ m#$/#); 
+    #die "Command has a newline in it!" if ($msg =~ m#$/#); 
     my $writer = $self->fromParentToChild();
     dwarn("Writing to baby!");
-    print $writer ($msg.$/);
+    _writeMsg($writer, { type => "COMMAND", results => $msg });
+    # print $writer ($msg.$/);
     # assume writer is flushed..
     return $self->readResponse();
 }
@@ -119,16 +121,17 @@ sub forkit {
     }    
 }
 
-sub readFromParent {
+sub readMsgFromParent {
     my ($self) = @_;
     my $read_pipe = $self->fromParentToChild();
-    my $line = <$read_pipe>;
-    return $line;
+    my $msg = _readMsg($read_pipe);
+    return $msg;
 }
+
 sub childLoop {
     my ($self) = @_;
     dwarn("Child reading from parent!");
-    while (my $command = $self->readFromParent()) {
+    while (my $command = $self->readMsgFromParent()) {
         dwarn("Have command! $command");
         my ($msg) = $self->parseCommand($command);
         my $res = $self->evalMsg($msg);
@@ -143,22 +146,21 @@ sub evalMsg {
     my $pid;
     my $results = undef;
     if ($pid = fork()) {
+        # parent
         $result_pipe->reader();
         $result_pipe->autoflush(1);
         my $time = $self->timeoutSeconds();
         my $SUCCESS = undef;
         timeout $time => sub {
-            $SUCCESS = <$result_pipe>;
-            chomp($SUCCESS) if $SUCCESS;
-            my $chars = <$result_pipe>;
-            #dwarn("Read: $chars");
-            $chars = _how_many_chars($chars);
-            #dwarn("CHARS: $chars");
-            $results="";
-            my $n = $result_pipe->read($results, $chars);
-            die "Read $n not $chars chars!" unless $n == $chars;
-            my $nl = <$result_pipe>;
-            ($results = "", $SUCCESS="failure") unless defined($nl) && ($nl eq $/);
+            my $msg = _readMsg($result_pipe);
+            if (defined($msg)) {
+                $SUCCESS = $msg->{type};
+                $results = $msg->{results};
+            } else {
+                $SUCCESS="failure";
+                $results = "The underlying process likely died";
+            }
+
             close($result_pipe);
             $result_pipe = undef;
         };
@@ -170,6 +172,7 @@ sub evalMsg {
             if (kill 0 => $pid) {
                 kill 9 => $pid;
             }
+            dwarn("A timeout occurred or the child died [$SUCCESS]");
             $self->sendFailure( results => $results );
         } else {
             # send info to parent
@@ -184,10 +187,7 @@ sub evalMsg {
         # we're a child lets run this command
         my $res = $self->runMsg($msg);
         # haha! we're still alive right!
-        print $result_pipe "SUCCESS$/";
-        print $result_pipe "CHARS: ".length($res).$/;
-        print $result_pipe $res;
-        print $result_pipe $/;
+        _writeMsg($result_pipe, { type=> "SUCCESS", results => $res });
         close($result_pipe);
         $result_pipe = undef;
     }    
@@ -203,8 +203,8 @@ sub cleanUpChildren {
 }
 sub parseCommand {
     my ($self,$command) = @_;
-    chomp($command);
-    return $command;
+    return $command->{results} if $command;
+    die "Invalid command to parse!";
 }
 
 
@@ -216,28 +216,88 @@ sub runMsg {
 }
 
 
-# Is there something better?
+sub _writeMsg {
+    my ($write_fd, $hash) = @_;
+    my $type = uc($hash->{type}) or die "No type for writeMsg!";
+    dwarn("Sending type: $type");
+    print $write_fd "$type$/";
+    while (my ($key,$val) = each %$hash) {
+        if ($key ne "CHARS" && lc($key) ne "type" && lc($key)  ne "results") {
+            unless ($val =~ m#$/#) {
+                dwarn("Sending $key: $val");
+                print $write_fd "$key: $val$/";
+            }
+        }
+    }
+    print $write_fd "CHARS: ".length($hash->{results}).$/;
+    print $write_fd $hash->{results};
+    print $write_fd $/;
+}
+
+
 sub sendSuccess {
     my ($self,%hash) = @_;
     my $pid = $hash{pid};
     my $str = $hash{results};
     my $len = length($str)||0;
     my $write_fd = $self->fromChildToParent();
-    print $write_fd "SUCCESS$/";
-    print $write_fd "NEW PID: $pid$/";
-    print $write_fd "CHARS: $len$/"; #plus 1 newline!
-    print $write_fd $str;
-    print $write_fd $/;
+    _writeMsg($write_fd, { type => "SUCCESS", "new pid" => $pid, "pid" => $pid, results => $str});
 }
 sub sendFailure {
     my ($self,%hash) = @_;
     my $str = $hash{results};
     my $len = length($str)||0;
     my $write_fd = $self->fromChildToParent();
-    print $write_fd "FAILURE$/";
-    print $write_fd "CHARS: $len$/"; #plus 1 newline!
-    print $write_fd $str;
-    print $write_fd $/;
+   _writeMsg($write_fd, { type => "FAILURE", results => $str});
+}
+
+# The format here is
+# name\n
+# metadata 1: value\n
+# metadata 2: value\n
+# ...
+# metadata n: value\n
+# CHARS: #ofchars\n#ascii integer
+# c1...cn\n
+#
+# Don't send the same metadata again
+
+sub _readMsg {
+    my ($reader) = @_;
+    my $name = <$reader>;
+    return undef unless defined $name;
+    chomp($name);
+    dwarn("Got name $name");
+    my $lname = lc($name);
+    my $out = {
+               type => $name,
+               $lname => 1,
+              };
+    my $chars = 0;
+    my $done = 0;
+    while(my $line = <$reader>) {
+        chomp($line);
+        dwarn("Read line: $line");
+        if ($line =~ /^CHARS:/) {
+            $chars = _how_many_chars($line);
+            last;
+        } elsif ($line =~ /^([ a-zA-Z0-9]+):\s(.*)$/) {
+            my ($key,$val) = ($1,$2);
+            $out->{$key} = $val unless exists $out->{$key};
+        } else {
+            die "I'm not sure how to parse [$line]";
+        }
+    }
+    dwarn("Expecting $chars");
+    my $results = "";
+    my $n = $reader->read($results, $chars);
+    dwarn("Read: $results");
+    die "Read $n not $chars chars!" unless $n == $chars;
+    my $nl = <$reader>;
+    die "[_readMsg] Not a newline: [$nl] [$results]" unless $nl eq $/;
+    $out->{len} = $n;
+    $out->{results} = $results;
+    return $out;
 }
 
 sub readResponse {
@@ -247,52 +307,23 @@ sub readResponse {
     my $isParent = $self->isParent();
     die "Not a parent, not forked [$hasForked] [$isParent]" unless ($hasForked && $isParent);
     my $reader = $self->fromChildToParent();
-    my $success_or_failure = <$reader>;
-    chomp($success_or_failure) if defined $success_or_failure;
     #dwarn("Result: $success_or_failure") if defined($success_or_failure);
-    if (!defined($success_or_failure)) {
-        warn "unexplained failure [probably death]";
+    my $msg = _readMsg($reader);
+    
+    if (!defined($msg)) {
+        warn "unexplained failure [probably death] [undefined \$msg]";
         $self->cleanUpChildren();
         $self->forkit();
         return {type => "FAILURE",
                 failure => 1,
                 results => "Not sure",
                };
-    } elsif ($success_or_failure eq 'SUCCESS') {
-        my $pid = <$reader>;
-        dwarn("Read: $pid");
-        $pid = _parse_pid($pid);
-        dwarn("PID: $pid");
-        my $chars = <$reader>;
-        dwarn("Read: $chars");
-        $chars = _how_many_chars($chars);
-        dwarn("CHARS: $chars");
-        my $results="";
-        my $n = $reader->read($results, $chars);
-        die "Read $n not $chars chars!" unless $n == $chars;
-        my $nl = <$reader>;
-        die "[S] Not a newline: [$nl] [$results]" unless $nl eq $/;
-        return {type => "SUCCESS",
-                success => 1, 
-                pid => $pid,
-                len => $chars,
-                results => $results,
-               };
-    } elsif ($success_or_failure eq 'FAILURE') {
-        my $chars = <$reader>;
-        $chars = _how_many_chars($chars);
-        my $results="";
-        my $n = $reader->read($results, $chars);
-        die "Read $n not $chars chars!" unless $n == $chars;
-        my $nl = <$reader>;
-        die "[F] Not a newline: [$nl] [$results]" unless $nl eq $/;
-        return {type => "FAILURE",
-                failure => 1, 
-                len => $chars,
-                results => $results
-               };
+    } elsif ($msg->{type} eq 'SUCCESS') {
+        return $msg;
+    } elsif ($msg->{type} eq 'FAILURE') {
+        return $msg;
     } else { #like an undef
-        die "Unexplained input $success_or_failure";
+        die "Unexplained input ".Dumper($msg);
     }
 }
 sub _how_many_chars {
@@ -336,7 +367,7 @@ sub run {
         my $res = undef;
         do {
             $res = $fr->send("Test $i");
-            warn "Not successful $i" if !$res->{success};
+            warn "Not successful $i".Dumper($res) if !$res->{success};
         } until ($res->{success})
     }
     warn "We finally go to 100!";
@@ -392,6 +423,31 @@ sub run {
         $cmpstate == $resc or  die "not State != State [$cmpstate] [$resc] ".Dumper($res);
 
     }
-    warn "We got from 1..100";
+    warn "We got from 1..100 for state";
+
+    my $newline_test = sub {
+        my ($self,$data) = @_;
+        srand();
+        if (int(rand(10))==0) {
+            proof_of_death("Newline Random Death [".length($data)."]");
+        } else {
+            my @nls = ($data =~ m#($/)#g);
+            return scalar(@nls);
+        }
+    };
+    my $cmpstate = 0;
+    $fr = ForkRing->new( code => $newline_test );
+    for my $c (1..100) {
+        #warn $c;
+        my $s = "$/"x$c;
+        my $res;
+        do {
+            $res = $fr->send($s);
+            warn "Not successful $c" if !$res->{success};
+        } until ($res->{success});
+        my $resc = $res->{results};
+        $c == $resc or die "Newlines didn't go through!";
+    }
+    warn "We got from 1..100 newline stuff";
     warn "Good everything worked!";
 }
