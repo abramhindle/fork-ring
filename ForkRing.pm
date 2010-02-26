@@ -50,7 +50,7 @@ $| = 1;
 use IO::Pipe;
 use Time::Out qw(timeout) ;
 $SIG{PIPE} = 'IGNORE';
-use POSIX ":sys_wait_h";
+use POSIX qw(sys_wait_h _exit);
 sub REAPER {
     my $waitedpid = wait;
     # loathe sysV: it makes us not only reinstate
@@ -59,7 +59,10 @@ sub REAPER {
 }
 $SIG{CHLD} = \&REAPER;
 
-
+sub install_handlers {
+    $SIG{PIPE} = 'IGNORE';
+    $SIG{CHLD} = \&REAPER;
+}
 
 
 has isParent          => ( is => 'rw', isa => 'Int', default => 0); #Pid
@@ -67,7 +70,7 @@ has hasForked         => ( is => 'rw', isa => 'Int', default => 0); #Pid
 has fromParentToChild => ( is => 'rw', isa => 'IO::Pipe');
 has fromChildToParent => ( is => 'rw', isa => 'IO::Pipe');
 has code              => ( is => 'rw', isa => 'CodeRef' );
-has timeoutSeconds    => ( is => 'rw', isa => 'Int', default => 10); #timeout time
+has timeoutSeconds    => ( is => 'rw', isa => 'Int', default => 30); #timeout time
 
 sub iopipe {
     my $pipe = IO::Pipe->new();
@@ -111,14 +114,23 @@ sub forkit {
         $p2c->autoflush(1);
         $c2p->reader();
         $c2p->autoflush(1);
+        utf8ify($c2p);
+        utf8ify($p2c);
     } else {
+        install_handlers();
         $self->isParent(0); # child
         $p2c->reader();
         $c2p->writer();
         $c2p->autoflush(1);
         $p2c->autoflush(1);
+        utf8ify($c2p);
+        utf8ify($p2c);
         return $self->childLoop();
     }    
+}
+sub utf8ify {
+    my ($a) = @_;
+    binmode $a, ":utf8";
 }
 
 sub readMsgFromParent {
@@ -137,7 +149,9 @@ sub childLoop {
         my $res = $self->evalMsg($msg);
         # chances are we're a different process now! isn't that neat ;)
     }
-    exit(0); #we're done yeah!
+    #die "We're done yeah!";
+    _exit(0);
+    #exit(0); #we're done yeah!
 }
 
 sub evalMsg {
@@ -148,6 +162,7 @@ sub evalMsg {
     if ($pid = fork()) {
         # parent
         $result_pipe->reader();
+        utf8ify( $result_pipe );
         $result_pipe->autoflush(1);
         my $time = $self->timeoutSeconds();
         my $SUCCESS = undef;
@@ -172,17 +187,25 @@ sub evalMsg {
             if (kill 0 => $pid) {
                 kill 9 => $pid;
             }
-            dwarn("A timeout occurred or the child died [$SUCCESS]");
-            $self->sendFailure( results => $results );
+            dwarn("A timeout occurred or the child died [".((defined($SUCCESS))?$SUCCESS:"undef")."]");
+            if ($@) {
+                $self->sendFailure( results => $@ );
+            } else {
+                $self->sendFailure( results => $results );
+            }
         } else {
             # send info to parent
             $self->sendSuccess(pid => $pid, results => $results);
             # kill self
-            exit(0);
+            #kill 1 => $$;
+            #die "Kill self";
+            _exit(0);
         }
     } else {
         # in the child
+        install_handlers();
         $result_pipe->writer();
+        utf8ify( $result_pipe );
         $result_pipe->autoflush(1);
         # we're a child lets run this command
         my $res = $self->runMsg($msg);
@@ -190,9 +213,7 @@ sub evalMsg {
         _writeMsg($result_pipe, { type=> "SUCCESS", results => $res });
         close($result_pipe);
         $result_pipe = undef;
-    }    
-    
-
+    }
 }
 sub cleanUpChildren {
     my ($self) = @_;
@@ -435,7 +456,7 @@ sub run {
             return scalar(@nls);
         }
     };
-    my $cmpstate = 0;
+    $cmpstate = 0;
     $fr = ForkRing->new( code => $newline_test );
     for my $c (1..100) {
         #warn $c;
